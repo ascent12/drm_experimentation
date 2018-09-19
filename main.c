@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdnoreturn.h>
 #include <unistd.h>
+#include <poll.h>
 
 #include "drm.h"
 #include "util.h"
@@ -112,6 +113,25 @@ int main(int argc, char *argv[])
 		tmp = conn->next;
 		new_connector(dev, conn->conn_id, conn->crtc_id, conn->primary_id);
 		free(conn);
+	}
+
+	struct pollfd fd = {
+		.fd = dev->conns->fence,
+		.events = POLLIN,
+	};
+
+	while (1) {
+		int ret = poll(&fd, 1, -1);
+		if (ret < 0)
+			fatal_errno("poll failed");
+		if (ret == 0)
+			continue;
+
+		if (fd.revents & (POLLERR | POLLHUP))
+			break;
+
+		swap_buffers(dev->conns);
+		fd.fd = dev->conns->fence;
 	}
 
 	close_drm(dev);

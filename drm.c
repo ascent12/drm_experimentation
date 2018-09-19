@@ -47,12 +47,17 @@ void close_drm(struct dev *dev)
 
 		drmModeDestroyPropertyBlob(dev->fd, conn->mode_id);
 		drmModeAtomicFree(conn->atomic);
-		drmModeFreeCrtc(conn->old_crtc);
 
 		for (int i = 0; i < 2; ++i) {
-			drmModeRmFB(dev->fd, conn->bo_id[i]);
+			drmModeRmFB(dev->fd, conn->fb_id[i]);
 			gbm_bo_destroy(conn->bo[i]);
 		}
+
+		drmModeCrtc *c = conn->old_crtc;
+
+		drmModeSetCrtc(dev->fd, c->crtc_id, c->buffer_id, c->x, c->y,
+			&conn->conn_id, 1, &c->mode);
+		drmModeFreeCrtc(conn->old_crtc);
 
 		free(conn);
 	}
@@ -104,10 +109,6 @@ void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t
 
 	drmModeFreeConnector(drm_conn);
 
-	conn->atomic = drmModeAtomicAlloc();
-	if (!conn->atomic)
-		fatal_errno("Failed to allocate atomic request");
-
 	uint64_t curr_crtc_id = 0;
 
 	struct prop conn_props[] = {
@@ -115,6 +116,7 @@ void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t
 	};
 
 	struct prop crtc_props[] = {
+		{ "ACTIVE", &conn->crtc_props.active, NULL },
 		{ "MODE_ID", &conn->crtc_props.mode_id, NULL },
 		{ "OUT_FENCE_PTR", &conn->crtc_props.out_fence_ptr, NULL },
 	};
@@ -212,7 +214,51 @@ void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t
 		}
 
 		if (drmModeAddFB2WithModifiers(dev->fd, width, height, pixel_format,
-				bo_handles, pitches, offsets, modifier, &conn->bo_id[i], flags))
+				bo_handles, pitches, offsets, modifier, &conn->fb_id[i], flags))
 			fatal_errno("Failed to create DRM buffer");
 	}
+
+	conn->atomic = drmModeAtomicAlloc();
+	if (!conn->atomic)
+		fatal_errno("Failed to allocate atomic request");
+
+	drmModeAtomicAddProperty(conn->atomic, conn->conn_id, conn->conn_props.crtc_id, conn->crtc_id);
+	drmModeAtomicAddProperty(conn->atomic, conn->crtc_id, conn->crtc_props.active, 1);
+	drmModeAtomicAddProperty(conn->atomic, conn->crtc_id, conn->crtc_props.mode_id, conn->mode_id);
+	drmModeAtomicAddProperty(conn->atomic, conn->crtc_id, conn->crtc_props.out_fence_ptr, (uint64_t)&conn->fence);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.crtc_id, conn->crtc_id);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.crtc_x, 0);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.crtc_y, 0);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.crtc_w, conn->width);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.crtc_h, conn->height);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.src_x, 0);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.src_y, 0);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.src_w, conn->width << 16);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.src_h, conn->height << 16);
+
+	int cursor = drmModeAtomicGetCursor(conn->atomic);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.fb_id, conn->fb_id[conn->front]);
+
+	if (drmModeAtomicCommit(dev->fd, conn->atomic, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK, NULL))
+		fatal_errno("Atomic commit failed");
+
+	drmModeAtomicSetCursor(conn->atomic, cursor);
+
+	printf("fence fd: %d\n", conn->fence);
+}
+
+void swap_buffers(struct conn *conn)
+{
+	struct dev *dev = conn->dev;
+
+	close(conn->fence);
+	conn->front = (conn->front + 1) % 2;
+
+	int cursor = drmModeAtomicGetCursor(conn->atomic);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.fb_id, conn->fb_id[conn->front]);
+
+	if (drmModeAtomicCommit(dev->fd, conn->atomic, DRM_MODE_ATOMIC_NONBLOCK, NULL))
+		fatal_errno("Atomic commit failed");
+
+	drmModeAtomicSetCursor(conn->atomic, cursor);
 }

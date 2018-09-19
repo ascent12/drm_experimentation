@@ -29,8 +29,6 @@ struct conn {
 	uint32_t width;
 	uint32_t height;
 
-	drmModeAtomicReq *atomic;
-
 	drmModeCrtc *old_crtc;
 
 	struct {
@@ -38,6 +36,7 @@ struct conn {
 	} conn_props;
 
 	struct {
+		uint32_t active;
 		uint32_t mode_id;
 		uint32_t out_fence_ptr;
 	} crtc_props;
@@ -56,14 +55,21 @@ struct conn {
 		uint32_t src_h;
 	} plane_props;
 
+	int fence;
+
 	int front;
 	struct gbm_bo *bo[2];
-	uint32_t bo_id[2];
+	uint32_t fb_id[2];
+
+	drmModeAtomicReq *atomic;
+
 };
 
 struct dev *open_drm(const char *path);
 void close_drm(struct dev *dev);
 
 void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t primary_id);
+
+void swap_buffers(struct conn *conn);
 
 #endif
