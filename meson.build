@@ -9,7 +9,10 @@ project('drm_playground', 'c',
 
 add_project_arguments('-D_POSIX_C_SOURCE=200809L', language: 'c')
 
-executable('drm_playground', 'main.c',
-  dependencies: dependency('libdrm'),
+executable('drm_playground', 'main.c', 'drm.c', 'util.c',
+  dependencies: [
+    dependency('libdrm'),
+    dependency('gbm'),
+  ],
   install: true,
 )
