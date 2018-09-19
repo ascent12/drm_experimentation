@@ -26,6 +26,8 @@ struct conn {
 	uint32_t primary_id;
 
 	uint32_t mode_id;
+	uint32_t width;
+	uint32_t height;
 
 	drmModeAtomicReq *atomic;
 
@@ -53,6 +55,10 @@ struct conn {
 		uint32_t src_w;
 		uint32_t src_h;
 	} plane_props;
+
+	int front;
+	struct gbm_bo *bo[2];
+	uint32_t bo_id[2];
 };
 
 struct dev *open_drm(const char *path);

@@ -10,6 +10,7 @@
 
 #include <drm.h>
 #include <drm_mode.h>
+#include <drm_fourcc.h>
 #include <gbm.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -43,9 +44,16 @@ void close_drm(struct dev *dev)
 	struct conn *tmp;
 	for (struct conn *conn = dev->conns; conn; conn = tmp) {
 		tmp = conn->next;
+
 		drmModeDestroyPropertyBlob(dev->fd, conn->mode_id);
 		drmModeAtomicFree(conn->atomic);
 		drmModeFreeCrtc(conn->old_crtc);
+
+		for (int i = 0; i < 2; ++i) {
+			drmModeRmFB(dev->fd, conn->bo_id[i]);
+			gbm_bo_destroy(conn->bo[i]);
+		}
+
 		free(conn);
 	}
 
@@ -90,6 +98,9 @@ void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t
 	if (drmModeCreatePropertyBlob(dev->fd, &drm_conn->modes[0],
 			sizeof drm_conn->modes[0], &conn->mode_id))
 		fatal_errno("Failed to create DRM property blob");
+
+	conn->width = drm_conn->modes[0].hdisplay;
+	conn->height = drm_conn->modes[0].vdisplay;
 
 	drmModeFreeConnector(drm_conn);
 
@@ -166,4 +177,42 @@ void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t
 	}
 
 	conn->old_crtc = drmModeGetCrtc(dev->fd, curr_crtc_id);
+
+	for (int i = 0; i < 2; ++i) {
+		conn->bo[i] = gbm_bo_create_with_modifiers(dev->gbm, conn->width, conn->height,
+			GBM_FORMAT_XRGB8888, NULL, 0);
+		if (!conn->bo[i])
+			fatal("Failed to create GBM bo");
+
+		struct gbm_bo *bo = conn->bo[i];
+
+		uint32_t width = gbm_bo_get_width(bo);
+		uint32_t height = gbm_bo_get_height(bo);
+		uint32_t pixel_format = gbm_bo_get_format(bo);
+		uint32_t bo_handles[4] = { 0 };
+		uint32_t pitches[4] = { 0 };
+		uint32_t offsets[4] = { 0 };
+
+		uint64_t mod = gbm_bo_get_modifier(bo);
+		uint64_t modifier_buf[4] = { mod, mod, mod, mod };
+
+		uint64_t *modifier = NULL;
+		uint64_t flags = 0;
+
+		if (mod != DRM_FORMAT_MOD_INVALID) {
+			modifier = modifier_buf;
+			flags = DRM_MODE_FB_MODIFIERS;
+		}
+
+		int planes = gbm_bo_get_plane_count(bo);
+		for (int i = 0; i < planes; ++i) {
+			bo_handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
+			pitches[i] = gbm_bo_get_stride_for_plane(bo, i);
+			offsets[i] = gbm_bo_get_offset(bo, i);
+		}
+
+		if (drmModeAddFB2WithModifiers(dev->fd, width, height, pixel_format,
+				bo_handles, pitches, offsets, modifier, &conn->bo_id[i], flags))
+			fatal_errno("Failed to create DRM buffer");
+	}
 }
