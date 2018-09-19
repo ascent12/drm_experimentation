@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <poll.h>
 
+#include <xf86drm.h>
+
 #include "drm.h"
 #include "util.h"
 
@@ -27,6 +29,18 @@ static noreturn void usage(int status, const char *fmt, ...)
 	fprintf(stderr, "  %s -h\n", progname);
 
 	exit(status);
+}
+
+void handle_sequence(int fd, uint64_t seq, uint64_t ns, uint64_t userdata)
+{
+	(void)fd;
+	(void)seq;
+
+	struct conn *conn = (void *)userdata;
+	struct dev *dev = conn->dev;
+
+	conn->curr_ns = ns;
+	draw(dev, &conn->bufs[(conn->front + 1) % 2], ns - conn->start_ns);
 }
 
 int main(int argc, char *argv[])
@@ -109,29 +123,51 @@ int main(int argc, char *argv[])
 
 	struct c *tmp;
 	for (struct c *conn = conns; conn; conn = tmp) {
-		printf("%"PRIu32" %"PRIu32"\n", conn->conn_id, conn->crtc_id);
 		tmp = conn->next;
 		new_connector(dev, conn->conn_id, conn->crtc_id, conn->primary_id);
 		free(conn);
 	}
 
-	struct pollfd fd = {
-		.fd = dev->conns->fence,
-		.events = POLLIN,
+	/*
+	 * TODO: Add a proper event loop which can handle more than one connector.
+	 * Some of this stuff doesn't belong in this file either.
+	 */
+
+	struct pollfd fd[2] = {
+		{ .fd = dev->fd, .events = POLLIN },
+		{ .fd = dev->conns->fence, .events = POLLIN },
 	};
 
 	while (1) {
-		int ret = poll(&fd, 1, -1);
+		int ret = poll(fd, 2, -1);
 		if (ret < 0)
 			fatal_errno("poll failed");
 		if (ret == 0)
 			continue;
 
-		if (fd.revents & (POLLERR | POLLHUP))
+		if (fd[0].revents & (POLLERR | POLLHUP)) {
 			break;
+		} else {
+			drmEventContext context = {
+				.version = DRM_EVENT_CONTEXT_VERSION,
+				.sequence_handler = handle_sequence,
+			};
 
-		swap_buffers(dev->conns);
-		fd.fd = dev->conns->fence;
+			drmHandleEvent(dev->fd, &context);
+		}
+
+		if (fd[1].revents & (POLLERR | POLLHUP)) {
+			break;
+		} else {
+			struct conn *conn = dev->conns;
+
+			swap_buffers(conn);
+			fd[1].fd = conn->fence;
+
+			drmCrtcQueueSequence(dev->fd, conn->crtc_id,
+				DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS,
+				1, NULL, (uint64_t)conn);
+		}
 	}
 
 	close_drm(dev);

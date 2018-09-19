@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,9 @@
 #include <xf86drmMode.h>
 
 #include "util.h"
+
+PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC glEGLImageTargetRenderbufferStorageOES;
+PFNEGLDUPNATIVEFENCEFDANDROIDPROC eglDupNativeFenceFDANDROID;
 
 struct dev *open_drm(const char *path)
 {
@@ -33,6 +37,47 @@ struct dev *open_drm(const char *path)
 	if (!dev->gbm)
 		fatal_errno("Failed to create GBM device");
 
+	dev->egl = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, dev->gbm, NULL);
+	if (dev->egl == EGL_NO_DISPLAY)
+		fatal("Failed to create EGL display");
+
+	if (!eglInitialize(dev->egl, NULL, NULL))
+		fatal("Failed to initialize EGL display");
+
+	glEGLImageTargetRenderbufferStorageOES = (PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC)
+		eglGetProcAddress("glEGLImageTargetRenderbufferStorageOES");
+	eglDupNativeFenceFDANDROID = (PFNEGLDUPNATIVEFENCEFDANDROIDPROC)
+		eglGetProcAddress("eglDupNativeFenceFDANDROID");
+
+	EGLint config_attribs[] = {
+		EGL_RED_SIZE, 8,
+		EGL_BLUE_SIZE, 8,
+		EGL_GREEN_SIZE, 8,
+		EGL_ALPHA_SIZE, 0,
+		EGL_CONFORMANT, EGL_OPENGL_ES2_BIT,
+		EGL_NONE,
+	};
+
+	EGLint n = 1;
+	if (!eglChooseConfig(dev->egl, config_attribs, &dev->config, n, &n))
+		fatal("Failed to choose EGL config");
+
+	EGLint format;
+	if (!eglGetConfigAttrib(dev->egl, dev->config, EGL_NATIVE_VISUAL_ID, &format))
+		fatal("Could not query EGL config");
+
+	dev->format = format;
+	printf("Format: %.4s\n", (char *)&dev->format);
+
+	EGLint context_attribs[] = {
+		EGL_CONTEXT_CLIENT_VERSION, 2,
+		EGL_NONE,
+	};
+
+	dev->context = eglCreateContext(dev->egl, dev->config, EGL_NO_CONTEXT, context_attribs);
+	if (dev->context == EGL_NO_CONTEXT)
+		fatal("Failed to create EGL context");
+
 	return dev;
 }
 
@@ -49,8 +94,10 @@ void close_drm(struct dev *dev)
 		drmModeAtomicFree(conn->atomic);
 
 		for (int i = 0; i < 2; ++i) {
-			drmModeRmFB(dev->fd, conn->fb_id[i]);
-			gbm_bo_destroy(conn->bo[i]);
+			struct buf *buf = &conn->bufs[i];
+
+			drmModeRmFB(dev->fd, buf->fb_id);
+			gbm_bo_destroy(buf->bo);
 		}
 
 		drmModeCrtc *c = conn->old_crtc;
@@ -65,6 +112,53 @@ void close_drm(struct dev *dev)
 	gbm_device_destroy(dev->gbm);
 	close(dev->fd);
 	free(dev);
+}
+
+void draw(struct dev *dev, struct buf *buf, uint64_t n)
+{
+	eglMakeCurrent(dev->egl, EGL_NO_SURFACE, EGL_NO_SURFACE, dev->context);
+
+	glBindRenderbuffer(GL_RENDERBUFFER, buf->renderbuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, buf->framebuffer);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, buf->renderbuffer);
+
+	float f = fmodf(n / 10000000.0f, 360.0f);
+	float x = 1.0f - fabsf(fmodf(f / 60.0f, 2.0f) - 1.0f);
+
+	switch ((int)floorf(f / 60.0f)) {
+	case 0:
+		glClearColor(1.0, x, 0.0, 1.0);
+		break;
+	case 1:
+		glClearColor(x, 1.0, 0.0, 1.0);
+		break;
+	case 2:
+		glClearColor(0.0, 1.0, x, 1.0);
+		break;
+	case 3:
+		glClearColor(0.0, x, 1.0, 1.0);
+		break;
+	case 4:
+		glClearColor(x, 0.0, 1.0, 1.0);
+		break;
+	case 5:
+		glClearColor(1.0, 0.0, x, 1.0);
+		break;
+	}
+
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	EGLSync sync = eglCreateSync(dev->egl, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+	if (sync == EGL_NO_SYNC)
+		fatal("Failed to create EGL sync");
+
+	buf->fence = eglDupNativeFenceFDANDROID(dev->egl, sync);
+	if (buf->fence < 0)
+		fatal("Failed to get EGL sync FD");
+
+	glFlush();
+
+	eglDestroySync(dev->egl, sync);
 }
 
 struct prop {
@@ -180,13 +274,17 @@ void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t
 
 	conn->old_crtc = drmModeGetCrtc(dev->fd, curr_crtc_id);
 
+	eglMakeCurrent(dev->egl, EGL_NO_SURFACE, EGL_NO_SURFACE, dev->context);
+
 	for (int i = 0; i < 2; ++i) {
-		conn->bo[i] = gbm_bo_create_with_modifiers(dev->gbm, conn->width, conn->height,
-			GBM_FORMAT_XRGB8888, NULL, 0);
-		if (!conn->bo[i])
+		struct buf *buf = &conn->bufs[i];
+
+		buf->bo = gbm_bo_create_with_modifiers(dev->gbm, conn->width, conn->height,
+			dev->format, NULL, 0);
+		if (!buf->bo)
 			fatal("Failed to create GBM bo");
 
-		struct gbm_bo *bo = conn->bo[i];
+		struct gbm_bo *bo = buf->bo;
 
 		uint32_t width = gbm_bo_get_width(bo);
 		uint32_t height = gbm_bo_get_height(bo);
@@ -214,9 +312,26 @@ void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t
 		}
 
 		if (drmModeAddFB2WithModifiers(dev->fd, width, height, pixel_format,
-				bo_handles, pitches, offsets, modifier, &conn->fb_id[i], flags))
+				bo_handles, pitches, offsets, modifier, &buf->fb_id, flags))
 			fatal_errno("Failed to create DRM buffer");
+
+		buf->image = eglCreateImage(dev->egl, dev->context,
+			EGL_NATIVE_PIXMAP_KHR, bo, NULL);
+		if (buf->image == EGL_NO_IMAGE)
+			fatal("Failed to create EGL image");
+
+		glGenRenderbuffers(1, &buf->renderbuffer);
+		glBindRenderbuffer(GL_RENDERBUFFER, buf->renderbuffer);
+		glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, buf->image);
+
+		glGenFramebuffers(1, &buf->framebuffer);
 	}
+
+	drmCrtcGetSequence(dev->fd, conn->crtc_id, NULL, &conn->start_ns);
+	conn->curr_ns = conn->start_ns;
+
+	struct buf *buf = &conn->bufs[conn->front];
+	draw(dev, buf, 0);
 
 	conn->atomic = drmModeAtomicAlloc();
 	if (!conn->atomic)
@@ -237,14 +352,20 @@ void new_connector(struct dev *dev, uint32_t conn_id, uint32_t crtc_id, uint32_t
 	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.src_h, conn->height << 16);
 
 	int cursor = drmModeAtomicGetCursor(conn->atomic);
-	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.fb_id, conn->fb_id[conn->front]);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.fb_id, buf->fb_id);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.in_fence_fd, buf->fence);
 
 	if (drmModeAtomicCommit(dev->fd, conn->atomic, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK, NULL))
 		fatal_errno("Atomic commit failed");
 
 	drmModeAtomicSetCursor(conn->atomic, cursor);
 
-	printf("fence fd: %d\n", conn->fence);
+	close(buf->fence);
+	buf->fence = -1;
+
+	drmCrtcQueueSequence(dev->fd, conn->crtc_id,
+		DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS,
+		1, NULL, (uint64_t)conn);
 }
 
 void swap_buffers(struct conn *conn)
@@ -253,12 +374,17 @@ void swap_buffers(struct conn *conn)
 
 	close(conn->fence);
 	conn->front = (conn->front + 1) % 2;
+	struct buf *buf = &conn->bufs[conn->front];
 
 	int cursor = drmModeAtomicGetCursor(conn->atomic);
-	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.fb_id, conn->fb_id[conn->front]);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.fb_id, buf->fb_id);
+	drmModeAtomicAddProperty(conn->atomic, conn->primary_id, conn->plane_props.in_fence_fd, buf->fence);
 
 	if (drmModeAtomicCommit(dev->fd, conn->atomic, DRM_MODE_ATOMIC_NONBLOCK, NULL))
 		fatal_errno("Atomic commit failed");
 
 	drmModeAtomicSetCursor(conn->atomic, cursor);
+
+	close(buf->fence);
+	buf->fence = -1;
 }
